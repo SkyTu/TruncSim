@@ -181,7 +181,10 @@ def _single_tensor_sgd(params: List[Tensor],
         # print("d_p is ", d_p)
         # print("param.data is ", param.data)
 
-        d_p = FixedTensor(d_p) *lr/batch_size
+        # mean-loss already averages by batch_size in the loss; rent-loss keeps
+        # the summed gradient on purpose (and compensates via smaller lr).
+        # Either way SGD must not divide by batch_size again.
+        d_p = FixedTensor(d_p) * lr
         param.add_(d_p, alpha=-1)
         
         # print("after adding, param.data is ", param.data)

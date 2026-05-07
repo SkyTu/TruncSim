@@ -17,10 +17,17 @@ import tqdm
 
 parser.add_argument('-trunc',
                     '--trunc_type',
-                    dest='trunc_type', 
+                    dest='trunc_type',
                     default=3,
-                    type=int, 
+                    type=int,
                     help='截断类别：0:faithful，1:stochastic，2:local，3:probabilistic in TruncXpert')
+
+parser.add_argument('-sm',
+                    '--softmax_type',
+                    dest='softmax_type',
+                    default=0,
+                    type=int,
+                    help='softmax协议：0:piranha-submax, 1:piranha-relu, 2:sigma, 3:plaintext-exact')
 
 parser.add_argument('-model',
                     '--model_name',
@@ -93,6 +100,12 @@ parser.add_argument('-t',
                     help='第t次实验')
 
 args = parser.parse_args()
+
+# Seed by --time so within the same `time` index, different trunc/softmax
+# settings start from the same random init (fair comparison); across times
+# we get 3 different inits for variance estimates.
+torch.manual_seed(args.time)
+np.random.seed(args.time)
 
 class AlexNet(torch.nn.Module):
     def __init__(self, num_classes=10):
@@ -300,7 +313,7 @@ def init_weights(model, weight_list):
             shape = param.shape
             # 计算当前参数需要的权重数量
             num_weights = np.prod(shape)
-            if("bias" in name):     
+            if("bias" in name):
             # 获取对应的权重列表的部分，并调整为相应的形状
                 weights = np.array(weight_list[idx: idx + num_weights]/(2**48)).reshape(shape)
             else:
@@ -311,6 +324,22 @@ def init_weights(model, weight_list):
             # 更新索引
             idx += num_weights
     print(f"Total number of weights set: {idx}")
+
+
+def init_weights_uniform(model, weight_list, scale_bits=24):
+    """All parameters (weight + bias) loaded with the same scale = 2^scale_bits.
+       Matches plaintext baseline convention (PSecureMlNoRelu.dat is stored as
+       fl=24 fixed-point integers; both weight and bias are recovered via /2^24).
+    """
+    idx = 0
+    for name, param in model.named_parameters():
+        if param.requires_grad:
+            shape = param.shape
+            num_weights = int(np.prod(shape))
+            weights = np.array(weight_list[idx: idx + num_weights] / (2**scale_bits)).reshape(shape)
+            param.data.copy_(torch.tensor(weights, dtype=param.dtype))
+            idx += num_weights
+    print(f"Total number of weights set (uniform /2^{scale_bits}): {idx}")
 
 def evaluate(model, test_loader):
     model.eval()  # Set the model to evaluation mode
@@ -327,7 +356,8 @@ def evaluate(model, test_loader):
     print("Validate acc:", accuracy)
     return accuracy
 
-truncation_type_name_list = ["stochastic", "faithful", "local", "TruncXpert"]
+truncation_type_name_list = ["faithful", "stochastic", "local", "TruncXpert"]
+softmax_type_name_list = ["piranha-submax", "piranha-relu", "sigma", "plaintext"]
 
 model = get_model(args.model_name)
 device = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -343,10 +373,15 @@ EPSILON = (1<<args.rent)
 Parameter.setfl(args.fl)
 Parameter.setwl(args.wl)
 Parameter.settrunc_type(args.trunc_type)
+Parameter.setsoftmax_type(args.softmax_type)
 BATCH_SIZE = args.batch_size
 EPOCHS = args.epoch
-loss_fn = qnn.CrossEntropyLoss(reduction=args.loss_type, epsilon=EPSILON).to(device)
-optimizer = optim.SGD(params=model.parameters(), momentum=args.momentum, lr=args.lr, batch_size=BATCH_SIZE, epsilon=EPSILON, loss_type=args.loss_type)
+# CrossEntropyLoss/SGD don't accept epsilon/loss_type kwargs.  Behavior differences:
+#   mean:  NLL divides loss by N → small per-sample gradient.
+#   rent:  NLL does not divide → sum-gradient retained (more bits survive truncation)
+#          and lr is expected to be reduced by ~N (set via --lr).
+loss_fn = qnn.CrossEntropyLoss(reduction=args.loss_type).to(device)
+optimizer = optim.SGD(params=model.parameters(), momentum=args.momentum, lr=args.lr, batch_size=BATCH_SIZE)
 accuracy = Accuracy(task='multiclass', num_classes=10)
 accuracy = accuracy.to(device)
 
@@ -358,14 +393,23 @@ if args.model_name == "CNN3":
     filename = 'weights/CNN3.dat'
     weights = read_file(filename)
     init_weights(model, weights)
+if args.model_name == "MLP3":
+    filename = 'weights/PSecureMlNoRelu.dat'
+    weights = read_file(filename)
+    # PSecureMlNoRelu.dat: both weight and bias stored as round(value * 2^24);
+    # recover via uniform /2^24 to match the plaintext baseline.
+    init_weights_uniform(model, weights, scale_bits=24)
 
 model = model.to(device)
 
     
-PATH = "output/"+args.model_name+"/" + args.loss_type + "/"
+SM_NAME = softmax_type_name_list[args.softmax_type]
+PATH = "output/"+args.model_name+"/" + SM_NAME + "/" + args.loss_type + "/"
 
 if args.trunc_type == 2:
-    PATH = "output/"+args.model_name+"/local/" + args.loss_type + "/"
+    PATH = "output/"+args.model_name+"/" + SM_NAME + "/local/" + args.loss_type + "/"
+
+os.makedirs(PATH, exist_ok=True)
 
 for epoch in range(EPOCHS):
     highest_acc = 0

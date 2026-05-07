@@ -62,6 +62,40 @@ def sqrt(input):
         res[input<=0] = 0
         return FixedTensor(res)
     
+def sigma_exp(input, lut_in_fl=None, lut_out_fl=None):
+    """SIGMA-style exp via LUT, simulated.
+    Errors come from: (1) input quantization at LUT-index precision,
+    (2) output quantization at LUT-entry precision. The "lookup" itself
+    returns the true value at the quantized index. Underflow region
+    (x <= -log(2^fl)) is clipped to 0 to match SIGMA's bounded LUT range.
+    """
+    with torch.no_grad():
+        in_fl = param.fl if lut_in_fl is None else lut_in_fl
+        out_fl = param.fl if lut_out_fl is None else lut_out_fl
+        x_q = FixedTensor(input).quant(fl=in_fl)
+        result = torch.exp(x_q)
+        result[x_q <= -math.log(2**param.fl)] = 0
+        return FixedTensor(result).quant(fl=out_fl)
+
+
+def sigma_recip(input, lut_in_fl=None, lut_out_fl=None):
+    """SIGMA-style 1/x via LUT, simulated.
+    Same error structure as sigma_exp: input quant + true reciprocal +
+    output quant. For softmax usage the input is sum(exp) >= 1, so no
+    div-by-zero concerns.
+    """
+    with torch.no_grad():
+        in_fl = param.fl if lut_in_fl is None else lut_in_fl
+        out_fl = param.fl if lut_out_fl is None else lut_out_fl
+        y_q = FixedTensor(input).quant(fl=in_fl)
+        # Floor at LSB to be safe against rare zero-sum cases.
+        y_q = torch.where(y_q.abs() < 2.0**(-in_fl),
+                          torch.full_like(y_q, 2.0**(-in_fl)),
+                          y_q)
+        result = 1.0 / y_q
+        return FixedTensor(result).quant(fl=out_fl)
+
+
 def approx_div(input1, input2, iter = 10):
     with torch.no_grad():
         
@@ -337,54 +371,196 @@ class MulFunction(torch.autograd.Function):
             
         return grad_input1, grad_input2
     
-class ApproxSoftMax(torch.autograd.Function):
+def _softmax_backward(ctx, grad_output):
+    """Standard softmax-Jacobian backward, shared across all forward variants.
+    The ReLU-trick has a different exact gradient, but in MPC training the
+    standard softmax gradient is commonly used as an approximation.
+    """
+    res, dim = ctx.saved_tensors
+    grad_input = None
+    dim = int(dim[0])
+    if ctx.needs_input_grad[0]:
+        if not isinstance(grad_output, FixedTensor):
+            grad_output = FixedTensor(grad_output).quant()
+        inter1 = torch.sum(FixedTensor(grad_output*res).quant(), dim=dim, keepdim=True)
+        inter2 = grad_output - inter1
+        grad_input = FixedTensor(res*inter2).quant()
+    return grad_input, None
+
+
+def _logsoftmax_backward(ctx, grad_output):
+    softmax_value, dim = ctx.saved_tensors
+    grad_input = None
+    dim = int(dim[0])
+    if ctx.needs_input_grad[0]:
+        if not isinstance(grad_output, FixedTensor):
+            grad_output = FixedTensor(grad_output).quant()
+        inter1 = FixedTensor(torch.sum(grad_output, dim=dim, keepdim=True))
+        inter2 = inter1*softmax_value
+        grad_input = FixedTensor(inter2 - grad_output)
+    return grad_input, None
+
+
+class PiranhaSubMaxSoftMax(torch.autograd.Function):
+    """Piranha softmax (subtract-max variant): the protocol used in USENIX'22 Piranha.
+       exp via iterated-squaring limit approximation, division via Goldschmidt.
+    """
     @staticmethod
-    def forward(ctx, input, dim = -1):
-        input_max = torch.max(input, dim = dim, keepdim = True).values
-        intermdiate = input - input_max  
+    def forward(ctx, input, dim=-1):
+        input_max = torch.max(input, dim=dim, keepdim=True).values
+        intermdiate = input - input_max
         intermdiate_exp = approx_exp(intermdiate)
-        res = approx_div(intermdiate_exp, torch.sum(intermdiate_exp, dim = dim, keepdim=True))
+        res = approx_div(intermdiate_exp, torch.sum(intermdiate_exp, dim=dim, keepdim=True))
         ctx.save_for_backward(res, Tensor([dim]))
         return res
-    
+
+    backward = staticmethod(_softmax_backward)
+
+
+class PiranhaReluSoftMax(torch.autograd.Function):
+    """Piranha softmax (ReLU-trick variant): softmax(x) ~ ReLU(x) / sum(ReLU(x)).
+       No exp needed; division via Goldschmidt. Matches SecureML / Piranha §5.
+    """
     @staticmethod
-    def backward(ctx, grad_output):
-        res, dim = ctx.saved_tensors
-        grad_input = None
-        dim = int(dim[0])
-        if ctx.needs_input_grad[0]:
-            if not isinstance(grad_output, FixedTensor):
-                grad_output = FixedTensor(grad_output).quant()
-            inter1 = torch.sum(FixedTensor(grad_output*res).quant(), dim = dim, keepdim = True)
-            inter2 = grad_output - inter1
-            grad_input = FixedTensor(res*inter2).quant()
-        
-        return grad_input, None    
-class ApproxLogSoftMax(torch.autograd.Function):
+    def forward(ctx, input, dim=-1):
+        relu_x = FixedTensor(torch.clamp(input, min=0)).quant()
+        sum_relu = FixedTensor(torch.sum(relu_x, dim=dim, keepdim=True)).quant()
+        # Floor at LSB to avoid 0/0 when an entire row is non-positive.
+        sum_relu = FixedTensor(torch.clamp_min(sum_relu, 2.0**(-param.fl))).quant()
+        res = approx_div(relu_x, sum_relu)
+        ctx.save_for_backward(res, Tensor([dim]))
+        return res
+
+    backward = staticmethod(_softmax_backward)
+
+
+class SigmaSoftMax(torch.autograd.Function):
+    """SIGMA softmax (PETS'24, simplified): subtract-max + LUT-modeled exp + LUT-modeled 1/sum.
+       Per the simplified model, LUT lookup = quant(input) -> true op -> quant(output).
+    """
     @staticmethod
-    def forward(ctx, input, dim = -1):
-        input_max = torch.max(input, dim = dim, keepdim = True).values
-        intermdiate = input - input_max  
+    def forward(ctx, input, dim=-1):
+        input_max = torch.max(input, dim=dim, keepdim=True).values
+        intermdiate = input - input_max
+        intermdiate_exp = sigma_exp(intermdiate)
+        sum_q = FixedTensor(torch.sum(intermdiate_exp, dim=dim, keepdim=True)).quant()
+        recip = sigma_recip(sum_q)
+        res = FixedTensor(intermdiate_exp * recip).quant()
+        ctx.save_for_backward(res, Tensor([dim]))
+        return res
+
+    backward = staticmethod(_softmax_backward)
+
+
+class PiranhaSubMaxLogSoftMax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, dim=-1):
+        input_max = torch.max(input, dim=dim, keepdim=True).values
+        intermdiate = input - input_max
         intermdiate_exp = approx_exp(intermdiate)
-        sum_ex = FixedTensor(torch.sum(intermdiate_exp, dim = dim, keepdim=True))
+        sum_ex = FixedTensor(torch.sum(intermdiate_exp, dim=dim, keepdim=True))
         logsum = log(sum_ex, math.e)
-        res =intermdiate  - logsum
+        res = intermdiate - logsum
         ctx.save_for_backward(approx_div(intermdiate_exp, sum_ex), Tensor([dim]))
         return res
-    
+
+    backward = staticmethod(_logsoftmax_backward)
+
+
+class PiranhaReluLogSoftMax(torch.autograd.Function):
+    """log(ReLU-trick softmax). Floor before log to avoid log(0); the
+       resulting gradient is approximated by the standard softmax-grad.
+    """
     @staticmethod
-    def backward(ctx, grad_output):
-        softmax_value,  dim = ctx.saved_tensors
-        grad_input  = None
-        dim = int(dim[0])
-        if ctx.needs_input_grad[0]:
-            if not isinstance(grad_output, FixedTensor):
-                grad_output = FixedTensor(grad_output).quant()
-            inter1 = FixedTensor(torch.sum(grad_output, dim = dim, keepdim = True))
-            inter2 = inter1*softmax_value
-            grad_input =  FixedTensor(inter2 - grad_output)
-        return grad_input, None       
-     
+    def forward(ctx, input, dim=-1):
+        relu_x = FixedTensor(torch.clamp(input, min=0)).quant()
+        sum_relu = FixedTensor(torch.sum(relu_x, dim=dim, keepdim=True)).quant()
+        sum_relu = FixedTensor(torch.clamp_min(sum_relu, 2.0**(-param.fl))).quant()
+        sm = approx_div(relu_x, sum_relu)
+        sm_floored = FixedTensor(torch.clamp_min(sm, 2.0**(-param.fl)))
+        res = log(sm_floored, math.e)
+        ctx.save_for_backward(sm, Tensor([dim]))
+        return res
+
+    backward = staticmethod(_logsoftmax_backward)
+
+
+class PlaintextSoftMax(torch.autograd.Function):
+    """Plaintext-exact softmax for ablation: torch.softmax then quant the output.
+       No protocol-level approximation; only the trailing fixed-point truncation
+       remains. Used to isolate the trunc protocol's impact from softmax error.
+    """
+    @staticmethod
+    def forward(ctx, input, dim=-1):
+        res = FixedTensor(torch.softmax(input, dim=dim)).quant()
+        ctx.save_for_backward(res, Tensor([dim]))
+        return res
+
+    backward = staticmethod(_softmax_backward)
+
+
+class PlaintextLogSoftMax(torch.autograd.Function):
+    """Plaintext-exact log_softmax. Backward stores plaintext softmax (consistent
+       with all other LogSoftMax variants saving their own protocol's softmax).
+    """
+    @staticmethod
+    def forward(ctx, input, dim=-1):
+        res = FixedTensor(torch.log_softmax(input, dim=dim)).quant()
+        sm_value = FixedTensor(torch.softmax(input, dim=dim)).quant()
+        ctx.save_for_backward(sm_value, Tensor([dim]))
+        return res
+
+    backward = staticmethod(_logsoftmax_backward)
+
+
+class SigmaLogSoftMax(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, input, dim=-1):
+        input_max = torch.max(input, dim=dim, keepdim=True).values
+        intermdiate = input - input_max
+        intermdiate_exp = sigma_exp(intermdiate)
+        sum_ex = FixedTensor(torch.sum(intermdiate_exp, dim=dim, keepdim=True)).quant()
+        logsum = log(sum_ex, math.e)
+        res = intermdiate - logsum
+        recip = sigma_recip(sum_ex)
+        ctx.save_for_backward(FixedTensor(intermdiate_exp * recip).quant(), Tensor([dim]))
+        return res
+
+    backward = staticmethod(_logsoftmax_backward)
+
+
+# Backward-compatible aliases.
+ApproxSoftMax = PiranhaSubMaxSoftMax
+ApproxLogSoftMax = PiranhaSubMaxLogSoftMax
+
+
+def _dispatch_softmax(self, dim):
+    t = param.softmax_type
+    if t == 0:
+        return PiranhaSubMaxSoftMax.apply(self, dim)
+    elif t == 1:
+        return PiranhaReluSoftMax.apply(self, dim)
+    elif t == 2:
+        return SigmaSoftMax.apply(self, dim)
+    elif t == 3:
+        return PlaintextSoftMax.apply(self, dim)
+    raise ValueError("unknown softmax_type={}".format(t))
+
+
+def _dispatch_log_softmax(self, dim):
+    t = param.softmax_type
+    if t == 0:
+        return PiranhaSubMaxLogSoftMax.apply(self, dim)
+    elif t == 1:
+        return PiranhaReluLogSoftMax.apply(self, dim)
+    elif t == 2:
+        return SigmaLogSoftMax.apply(self, dim)
+    elif t == 3:
+        return PlaintextLogSoftMax.apply(self, dim)
+    raise ValueError("unknown softmax_type={}".format(t))
+
+
+
 class FixedTensor(torch.Tensor): 
 
     def round(self):
@@ -393,14 +569,17 @@ class FixedTensor(torch.Tensor):
         self = FixedTensor(torch.div(torch.round(torch.mul(self,2**param.fl)), 2**param.fl))
         return self
     
-    def quant(self, wl = param.wl, bitlength = param.bitlength, fl =param.fl, trunc_type = param.trunc_type):
+    def quant(self, wl=None, bitlength=None, fl=None, trunc_type=None):
         if self.dtype == torch.bool:
             return FixedTensor(self)
-        wl = param.wl
-        bitlength = param.bitlength
-        fl =param.fl
-        trunc_type = param.trunc_type
-        self = FixedTensor(fixed_point_quantize(self, wl = wl, bitlength = bitlength ,fl = fl, trunc_type =trunc_type, clamp=True, rounding="prob_error", trunc = True))
+        # Honor caller overrides; fall back to current Parameter values.
+        # Per-call override is needed by SIGMA-style LUT simulation, where
+        # LUT input/output may use different fl than the global setting.
+        wl = param.wl if wl is None else wl
+        bitlength = param.bitlength if bitlength is None else bitlength
+        fl = param.fl if fl is None else fl
+        trunc_type = param.trunc_type if trunc_type is None else trunc_type
+        self = FixedTensor(fixed_point_quantize(self, wl=wl, bitlength=bitlength, fl=fl, trunc_type=trunc_type, clamp=True, rounding="prob_error", trunc=True))
         return self
 
     def __mul__(self, other):
@@ -429,11 +608,11 @@ class FixedTensor(torch.Tensor):
     def std(self, dim = None, keepdim=False,unbiased=False):
         return StdFunction.apply(self, dim, keepdim, unbiased)
     
-    def softmax(self, dim= -1):
-        return ApproxSoftMax.apply(self, dim)
-    
-    def log_softmax(self, dim = -1):
-        return ApproxLogSoftMax.apply(self, dim)
+    def softmax(self, dim=-1):
+        return _dispatch_softmax(self, dim)
+
+    def log_softmax(self, dim=-1):
+        return _dispatch_log_softmax(self, dim)
     
     def log(self, b):
         return LogFunction.apply(self, b)

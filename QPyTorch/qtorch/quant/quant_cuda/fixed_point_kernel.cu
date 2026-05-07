@@ -119,10 +119,17 @@ __global__ void fixed_point_quantize_kernel_prob_error(float* __restrict__ a,
           o[index] = floor(o[index]);
         }
 
-       
+        // trunc_type==3: -1 LSB error mirror of stochastic (trunc_type==1).
+        // Same pr1 (fractional-part probability), but subtracts instead of adds,
+        // so error vs faithful is {-1, 0} (mirror of tt==1's {0, +1}).
+        if (trunc_type == 3){
+          auto pr1 = o[index] - truncf(o[index]) +1 - truncf(o[index] - truncf(o[index])+1);
+          o[index] = o[index] - prob_gen(pr1, r1[index]);
+          o[index] = floor(o[index]);
+        }
 
         // convert_to_fixed_point_with_trunc(o[index], wl, fl, pp, pv, np, nv, r[index]);
-        o[index] = ldexp(o[index], sigma);        
+        o[index] = ldexp(o[index], sigma);
     // }
     // if (use_clamp) {
     //   o[index] = clamp_helper(o[index], t_min, t_max);
