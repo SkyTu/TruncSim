@@ -1,7 +1,7 @@
 class Parameter:
     wl = 64
     bitlength = 63
-    fl = 14
+    fl = 16
     trunc_type = 1 # 0 fatithful 1 stochastic 2 local
     pp = 0.5
     pv = 1

@@ -31,8 +31,8 @@ Parameter.settrunc_type(1)
 
 mnist_transforms = transforms.Compose([transforms.ToTensor()])#,
                                     #    transforms.Normalize(mean=mean, std=std)])
-train_dataset = torchvision.datasets.MNIST(root="./data/", train=True, download=True, transform=mnist_transforms)
-test_dataset = torchvision.datasets.MNIST(root="./data/", train=False, download=True, transform=mnist_transforms)
+train_dataset = torchvision.datasets.MNIST(root="./dataset/", train=True, download=True, transform=mnist_transforms)
+test_dataset = torchvision.datasets.MNIST(root="./dataset/", train=False, download=True, transform=mnist_transforms)
 # train_size = int(0.9 * len(train_val_dataset))
 # val_size = len(train_val_dataset) - train_size
 
@@ -151,30 +151,30 @@ for epoch in tqdm(range(EPOCHS)):
     train_loss /= len(train_dataloader)
     train_acc /= len(train_dataloader)
         
-    # Validation loop
-    val_loss, val_acc = 0.0, 0.0
-    model_lenet5v1.eval()
-    with torch.inference_mode():
-        for X, y in test_dataloader:
-            X, y = X.to(device), y.to(device)
-            # print(y)
+    # # Validation loop
+    # val_loss, val_acc = 0.0, 0.0
+    # model_lenet5v1.eval()
+    # with torch.inference_mode():
+    #     for X, y in test_dataloader:
+    #         X, y = X.to(device), y.to(device)
+    #         # print(y)
             
-            X, y = FixedTensor(X).round(), FixedTensor(y)
+    #         X, y = FixedTensor(X).round(), FixedTensor(y)
             
-            y_pred = model_lenet5v1(X)
+    #         y_pred = model_lenet5v1(X)
             
-            loss = loss_fn(y_pred, y)
-            val_loss += loss.item()
+    #         loss = loss_fn(y_pred, y)
+    #         val_loss += loss.item()
             
-            acc = accuracy(y_pred, y)
-            val_acc += acc
+    #         acc = accuracy(y_pred, y)
+    #         val_acc += acc
             
-        val_loss /= len(test_dataloader)
-        val_acc /= len(test_dataloader)
+    #     val_loss /= len(test_dataloader)
+    #     val_acc /= len(test_dataloader)
         
-    writer.add_scalars(main_tag="Loss", tag_scalar_dict={"train/loss": train_loss, "val/loss": val_loss}, global_step=epoch)
-    writer.add_scalars(main_tag="Accuracy", tag_scalar_dict={"train/acc": train_acc, "val/acc": val_acc}, global_step=epoch)
+    # writer.add_scalars(main_tag="Loss", tag_scalar_dict={"train/loss": train_loss, "val/loss": val_loss}, global_step=epoch)
+    # writer.add_scalars(main_tag="Accuracy", tag_scalar_dict={"train/acc": train_acc, "val/acc": val_acc}, global_step=epoch)
     
-    print(train_acc)
-    print(val_acc)
-    print(f"Epoch: {epoch}| Train loss: {train_loss: .5f}| Train acc: {train_acc: .5f}| Val loss: {val_loss: .5f}| Val acc: {val_acc: .5f}")
+    # print(train_acc)
+    # print(val_acc)
+    # print(f"Epoch: {epoch}| Train loss: {train_loss: .5f}| Train acc: {train_acc: .5f}| Val loss: {val_loss: .5f}| Val acc: {val_acc: .5f}")
